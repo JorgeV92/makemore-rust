@@ -1,0 +1,8 @@
+[package]
+name = "makemore"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ndarray = "0.16.1"
+nalgebra = "0.33.2"
