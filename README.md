@@ -1,8 +1,12 @@
-Perfect. I’ll put together a plan for re-implementing the Transformer model from `makemore` in Rust, focusing on a GPU-accelerated version. I’ll cover which crates you can use (and which ones to skip), how the architecture maps from Python to Rust, and what to build from scratch if you're aiming to learn deeper.
+<p align="center">
+  <img src="https://www.rustacean.net/assets/rustacean-flat-happy.svg" width="200" alt="Ferris the crab"/>
+</p>
 
-Give me a moment to lay it all out.
+# MakeMore in Rust 
 
-# Translating Karpathy’s Transformer to Rust – Plan & Resource Guide
+
+
+# Karpathy’s Transformer to Rust – Plan & Resource Guide
 
 ## Overview 
 This guide outlines a step-by-step plan to implement Andrej Karpathy’s **Makemore Transformer** (a GPT-style character-level language model) in Rust. We will focus exclusively on the Transformer model (ignoring bigrams, RNNs, etc.) and incorporate **GPU acceleration** to leverage modern hardware. The emphasis is on **learning** – we’ll discuss when to use existing Rust crates versus implementing features from scratch to maximize understanding. We’ll also cover practical aspects like model architecture, training loops, data loading, text sampling, logging (TensorBoard-style), project structure, and relevant Rust resources as of 2025.
