@@ -4,14 +4,17 @@
 
 
 extern crate ndarray;
-use ndarray::{ArrayD, Array};
+use ndarray::{Array, Array1, Array2, Array3, Array4, ArrayD};
 use core::{f64, str};
-use std::f64::consts::PI;
+use std::{f64::consts::PI};
 use ndarray::prelude::*;
 
 
 
 #[derive(Debug, Clone)]
+///
+/// ----- Configuration struct -----
+/// 
 pub struct ModelConfig {
     pub block_size: Option<usize>,
     pub vocab_size: Option<usize>,
@@ -35,6 +38,9 @@ impl Default for ModelConfig {
 }
 
 #[derive(Debug, Clone)]
+///
+/// ----- GELU Activation -----
+/// 
 pub struct NewGELU;
 
 impl NewGELU {
@@ -67,6 +73,9 @@ impl NewGELU {
 /// - bias has shape (out_features)
 /// 
 #[derive(Debug, Clone)]
+///
+/// ----- Linear Layer -----
+/// 
 pub struct Linear {
     pub weight: Array2<f64>,    // shape: (out_features, in_features)
     pub bias: Array1<f64>,      // shape: (out_features)
@@ -264,6 +273,7 @@ impl CausalSelfAttention {
 }
 
 ///
+/// ----- Layer Normalization -----
 /// A naïve first step implementation maybe update to follow Pytorch nn.LinearNorm
 /// for now on the last axis (the embedding dimesion)
 /// 
@@ -379,6 +389,126 @@ impl Block {
     }
 }
 
+///
+/// ----- Simple Embedding module -----
+/// 
+#[derive(Debug, Clone)]
+pub struct Embedding {
+    pub weight: Array2<f64>,    // weught shape: (num_embeddings, embedding_dim)    
+}
+
+impl Embedding {
+    // Given a tensor of indices of shape (B, T) return embeddings of shape (B, T embedding_dim)
+    pub fn forward(&self, idx: &Array2<usize>) -> Array3<f64> {
+        let (b, t) = idx.dim();
+        let (_, n_embd) = self.weight.dim();
+        let mut out = Array3::<f64>::zeros((b, t, n_embd));
+        for bi in 0..b {
+            for ti in 0..t {
+                let token = idx[[bi, ti]];
+                out.slice_mut(s![bi, ti, ..]).assign(&self.weight.row(token));
+            }
+        }
+        out 
+    }
+}
+
+///
+/// ----- Transformer Model -----
+/// 
+#[derive(Debug)]
+pub struct Transformer {
+    pub block_size: usize,
+    pub wte: Embedding,     // token embeddings
+    pub wpe: Embedding,     // position embeddings
+    pub h: Vec<Block>,      // stack of transformer blocks
+    pub ln_f: LayerNorm,    // final layer normalization
+    pub lm_head: Linear,    // language model head
+}
+
+impl Transformer {
+    pub fn new(config: &ModelConfig) -> Self {
+        let block_size = config.block_size.expect("block_size is required");
+        let voacb_size = config.vocab_size.expect("voacb_size is required");
+        let n_embd = config.n_embd;
+
+        let wte = Embedding { weight: Array2::zeros((voacb_size, n_embd)) };
+        let wpe = Embedding { weight: Array2::zeros((block_size, n_embd)) };
+
+        let mut h = Vec::with_capacity(config.n_layer);
+        for _ in 0..config.n_layer {
+            h.push(Block::new(n_embd, config.n_head, block_size));
+        }
+
+        let ln_f = LayerNorm::new(n_embd, 1e-5);
+
+        // For lm_head we tie weights to the embedding matrix in GPT-2
+        // (here we create a separate Linear layer with bias disabled.)
+        let lm_head = Linear {
+            weight: Array2::zeros((voacb_size, n_embd)),
+            bias: Array1::zeros(voacb_size),
+        };
+
+        // (For demonstration, we skip parameter counting—one could iterate over each module’s parameters.)
+        // println!("number of parameters: {}M", 0.0);
+
+        Self {
+            block_size,
+            wte, 
+            wpe,
+            h,
+            ln_f,
+            lm_head,
+        }
+    }
+
+    pub fn get_block_size(&self) -> usize {
+        self.block_size
+    }
+
+    ///
+    /// Forward pass accepts:
+    /// -idx: an Array2 of shape (B, T) (token indices)
+    /// - targets: Optional target indices (for computing a loss)
+    /// Returns (logits, loss)
+    /// 
+    pub fn forward(&self, idx: &Array2<usize>, targets: Option<&Array2<usize>>) -> (Array3<f64>, Option<f64>) {
+        let (b, t) = idx.dim();
+        if t > self.block_size {
+            panic!("Cannot forward sequence of length {}, block size is only {}", t, self.block_size);
+        }
+
+        // create positional indices of shape (1, t)
+        let pos = Array2::from_shape_fn((1, t), |(_, j)| j);
+        let tok_emb = self.wte.forward(idx);          // (B, T, n_embd)
+        let pos_emb = self.wpe.forward(&pos);       // (1, T, n_embd)
+        let shape = tok_emb.dim();
+        // Broadcast pos_emb to (B, T, n_embd) and add to token embeddings
+        let x = tok_emb + pos_emb.broadcast(shape).unwrap();
+
+        // Pass through each Block
+        let mut x = x;
+        for block in &self.h {
+            x = block.forward(&x);
+        }
+        // Final layer norm 
+        x = self.ln_f.forward(&x);
+        // language model head: project embeddings to vocabulary logits
+        let logits = self.lm_head.forward(&x);
+        
+        // compute loss. 
+        // [TODO]
+        let loss = if targets.is_some() {
+            Some(0.0)
+        } else {
+            None
+        };
+
+        (logits, loss)
+    }
+}
+
+
 fn main() { 
 
     println!("
@@ -434,5 +564,30 @@ fn main() {
     let mlp_output = mlp.forward(&x);
     println!("MLP output shape: {:?}", mlp_output.dim());
 
+    println!(
+        "// ----------------------------------------------------------------------------------------------------
+        //                                      Sample Transformer
+        // ----------------------------------------------------------------------------------------------------"
+    );
+
+    let config = ModelConfig {
+        block_size: Some(16),
+        vocab_size: Some(50257),
+        n_layer: 4,
+        n_embd: 65,
+        n_embd2: 64,
+        n_head: 4,
+    };
+
+    let transformer = Transformer::new(&config);
+    let idx = Array2::<usize>::zeros((batch_size, sequencele_length));
+    println!("Initialized Transformer:\n{:#?}", transformer);
+
+    // // Run forward pass test
+    // let (logits, loss) = transformer.forward(&idx, None);
+    // println!("Logits shape: {:?}", logits.dim());
+    // if let Some(l) = loss {
+    //     println!("Loss: {}", l);
+    // }
 }
 
