@@ -4,8 +4,8 @@
 
 
 extern crate ndarray;
-use ndarray::ArrayD;
-use core::f64;
+use ndarray::{ArrayD, Array};
+use core::{f64, str};
 use std::f64::consts::PI;
 use ndarray::prelude::*;
 
@@ -34,6 +34,7 @@ impl Default for ModelConfig {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct NewGELU;
 
 impl NewGELU {
@@ -41,6 +42,8 @@ impl NewGELU {
     ///
     /// The GELU activation function defined as:
     /// 0.5 * x * (1.0 + tanh(sqrt(2.0/PI) * (x + 0.044715 * x^3) ))
+    /// [TODO] research if we would need a D-dimensional array or 
+    /// we could just use a 3D- a rray always
     pub fn forward(&self, input: &ArrayD<f64>) -> ArrayD<f64> {
         // Calculate the scaling factor: sqrt(2.0/PI)
         let scale = (2.0 / PI).sqrt();
@@ -63,6 +66,7 @@ impl NewGELU {
 /// - weight has shape (out_features, in_features)
 /// - bias has shape (out_features)
 /// 
+#[derive(Debug, Clone)]
 pub struct Linear {
     pub weight: Array2<f64>,    // shape: (out_features, in_features)
     pub bias: Array1<f64>,      // shape: (out_features)
@@ -110,6 +114,7 @@ fn lower_triangular(n: usize) -> Array2<f64> {
 /// It contains two layer for computing query, key, valye (c_attn) and for output projection (c_proj).
 /// The bias field holds the causal mask (shape: (1, 1, block_size, block_size)).
 /// 
+#[derive(Debug, Clone)]
 pub struct CausalSelfAttention {
     pub c_attn: Linear,             // projects input (n_embd) to 3 * n n_embd (query, key, value)
     pub c_proj: Linear,             // outout projection from n_embd to n_embd
@@ -258,7 +263,121 @@ impl CausalSelfAttention {
     
 }
 
+///
+/// A naïve first step implementation maybe update to follow Pytorch nn.LinearNorm
+/// for now on the last axis (the embedding dimesion)
+/// 
+#[derive(Debug, Clone)]
+pub struct LayerNorm {
+    pub normalized_shape: usize,
+    pub epsilon: f64,
+}
 
+impl LayerNorm {
+    pub fn new(normalized_shape: usize, epsilon: f64) -> Self {
+        Self { 
+            normalized_shape,
+            epsilon 
+        }
+    }
+
+    ///
+    /// For an input of shape (B, T ,C), normalize across the last dimension 
+    /// 
+    pub fn forward(&self, input: &Array3<f64>) -> Array3<f64> {
+        let (B, T, C) = input.dim();
+        let mut output = Array3::<f64>::zeros((B, T, C));
+        for b in 0..B {
+            for t in 0..T {
+                let x_slice = input.slice(s![b, t, ..]);
+                let mean = x_slice.mean().unwrap();
+                // compute variance maunuallu
+                // [TODO] 
+                let var = x_slice.mapv(|v| (v - mean).powi(2)).mean().unwrap();
+                for c in 0..C {
+                    output[[b, t, c]] = (input[[b, t, c]] - mean) / (var + self.epsilon).sqrt();
+                }   
+            }
+        }
+
+        output
+    }
+
+}
+
+
+///
+/// MLP module that applies: c_fc -> act -> c_proj
+/// 
+#[derive(Debug, Clone)]
+pub struct MLP {
+    pub c_fc: Linear,
+    pub c_proj: Linear,
+    pub act: NewGELU
+}
+
+impl MLP {
+    pub fn new(n_embd: usize) -> Self {
+        Self { 
+            c_fc: Linear {
+                weight: Array2::zeros((4 * n_embd, n_embd)),
+                bias: Array1::zeros(4 * n_embd),
+            },
+            c_proj: Linear {
+                weight: Array2::zeros((n_embd, 4 * n_embd)),
+                bias: Array1::zeros(n_embd),
+            },
+            act: NewGELU,
+        }
+    }
+    
+    pub fn forward(&self, x: &Array3<f64>) -> Array3<f64> {
+        // [D]
+        // Implementation for a D-dimensional array 
+        let x = self.c_fc.forward(x);
+        let x_dyn = x.into_dyn();
+        let x_activation = self.act.forward(&x_dyn);
+        let x_fixed = x_activation.into_dimensionality::<Ix3>().expect("Expected Array3<f64>");
+        self.c_proj.forward(&x_fixed)
+    }
+}
+
+///
+/// The [Transformer] block that combines layer norms, causal attention, and an MLP.
+/// 
+#[derive(Debug, Clone)]
+pub struct  Block {
+    pub ln_1: LayerNorm,
+    pub attn: CausalSelfAttention,
+    pub ln_2: LayerNorm,
+    pub mlp: MLP,
+}
+
+impl Block {
+    pub fn new(n_embd: usize, n_head: usize, block_size: usize) -> Self {
+        Self {
+            ln_1: LayerNorm::new(n_embd, 1e-5),
+            attn: CausalSelfAttention::new(n_embd, n_head, block_size),
+            ln_2: LayerNorm::new(n_embd, 1e-5),
+            mlp: MLP::new(n_embd),
+        }
+    }
+
+    ///
+    /// Forward pass for the block:
+    /// x = x _ attn(ln_1(x))
+    /// x = x + mlp(ln_2(x))
+    /// 
+    pub fn forward(&self, x: &Array3<f64>) -> Array3<f64> {
+        // Apply first layer norm then attention; add residual connection.
+        let attn_out = self.attn.forward(&self.ln_1.forward(x));
+        let x = x + &attn_out;
+
+        // Apply second layer norm then MLP; add residual connection.
+        let mlp_out = self.mlp.forward(&self.ln_2.forward(&x));
+        x + &mlp_out
+    }
+}
 
 fn main() { 
 
@@ -298,6 +417,22 @@ fn main() {
 
     let output = att_layer.forward(&x);
     println!("Attention output shape: {:?}", output.dim());
+
+    println!(
+        "// ----------------------------------------------------------------------------------------------------
+        //                                      Sample Block
+        // ----------------------------------------------------------------------------------------------------"
+    );
+    let transformer_block = Block::new(n_embd, n_head, block_size);
+    let mlp = MLP::new(n_embd);
+    println!("Initialized Block: {:?}", transformer_block);
+    println!("Initialized MLP: {:?}", mlp);
+
+    let block_output = transformer_block.forward(&x);
+    println!("Block output shape: {:?}", block_output.dim());
+
+    let mlp_output = mlp.forward(&x);
+    println!("MLP output shape: {:?}", mlp_output.dim());
 
 }
 
