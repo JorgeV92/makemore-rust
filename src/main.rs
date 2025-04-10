@@ -1,3 +1,8 @@
+#![allow(non_snake_case)]
+#![allow(non_camel_case_types)]
+#![allow(non_upper_case_globals)]
+
+
 extern crate ndarray;
 use ndarray::ArrayD;
 use core::f64;
@@ -76,7 +81,7 @@ impl Linear {
                 let x_vec = x.slice(s![b, t, ..]);
                 for o in 0..out_features {
                     // Dot prod of weight row o with the input vector plus bias.
-                    output[[b, t, o]] = self.weight.row(o).dot(&x_vec) + self.bias[0];
+                    output[[b, t, o]] = self.weight.row(o).dot(&x_vec) + self.bias[o];
                 }
             }
         }
@@ -136,7 +141,7 @@ impl CausalSelfAttention {
 
         // Create the causal mask: a lower triangular matrix of ones, then reshape to (1, 1, block_size, block_size)
         let tril = lower_triangular(block_size);
-        let bias = tril.into_shape_with_order((1,1,block_size,block_size)).unwrap();
+        let bias = tril.to_shape((1,1,block_size,block_size)).unwrap().to_owned();
 
         Self {
             c_attn, 
@@ -187,9 +192,9 @@ impl CausalSelfAttention {
         let v = c_attn_out.slice(s![..,..,2 * self.n_embd..3 * self.n_embd]).to_owned();
 
         // Reshape each of q, k, v into (B, T, n_head, head_size) then permute to (B, n_head, head_size)
-        let q = q.into_shape_with_order((B, T, self.n_head, head_size)).unwrap().permuted_axes([0, 2, 1, 3]);
-        let k = k.into_shape_with_order((B, T, self.n_head, head_size)).unwrap().permuted_axes([0, 2, 1, 3]);
-        let v = v.into_shape_with_order((B, T, self.n_head, head_size)).unwrap().permuted_axes([0, 2, 1, 3]);
+        let q = q.to_shape((B, T, self.n_head, head_size)).unwrap().permuted_axes([0, 2, 1, 3]).to_owned();
+        let k = k.to_shape((B, T, self.n_head, head_size)).unwrap().permuted_axes([0, 2, 1, 3]).to_owned();
+        let v = v.to_shape((B, T, self.n_head, head_size)).unwrap().permuted_axes([0, 2, 1, 3]).to_owned();
 
         // Compute raw attention scores: (B, n_head, T, T) = q @ k^t
         let scale = 1.0 / (head_size as f64).sqrt();
@@ -244,13 +249,10 @@ impl CausalSelfAttention {
         // Reassemble the multi-head outputs: transpose from (B, n_head, T, head_size)
         // to (B, T, n_embd) where n _embd = n_head * head_size.
         let y = y.permuted_axes([0, 2, 1, 3])
-            .into_shape_with_order((B, T, self.n_embd))
-            .unwrap();
+            .to_shape((B, T, self.n_embd))
+            .unwrap()
+            .to_owned();
         
-        // ####################################################################################
-        // -> [TODO TOMORROW] double check the above line [ERROR] with dimension in the unwrap
-        // ####################################################################################
-
         self.c_proj.forward(&y)
     }
     
@@ -260,9 +262,6 @@ impl CausalSelfAttention {
 
 fn main() { 
 
-    // ----------------------------------------------------------------------------------------------------
-    //                                  Sample the config struct 
-    // ----------------------------------------------------------------------------------------------------
     println!("
              // ----------------------------------------------------------------------------------------------------
             //                                  Sample the config struct 
@@ -271,9 +270,6 @@ fn main() {
     let config = ModelConfig::default();
     println!("{:?}", config);
 
-    // ----------------------------------------------------------------------------------------------------
-    //                                  Sample the GELU activation 
-    // ----------------------------------------------------------------------------------------------------
     println!("
         // ----------------------------------------------------------------------------------------------------
         //                                  Sample the GELU activation 
@@ -285,14 +281,12 @@ fn main() {
     println!("Input: {:?}", input);
     println!("Output: {:?}", output);
 
-    // ----------------------------------------------------------------------------------------------------
-    //                                  Sample the Causal Self Attention
-    // ----------------------------------------------------------------------------------------------------
-    println!(
+
+    println!("
         // ----------------------------------------------------------------------------------------------------
         //                                  Sample the Causal Self Attention
         // ----------------------------------------------------------------------------------------------------
-    );
+    ");
     let n_embd = 64;
     let n_head = 4;
     let block_size = 16;
