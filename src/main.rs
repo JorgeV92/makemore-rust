@@ -1,3 +1,5 @@
+// [LIBTORCH_USE_PYTORCH=1 cargo run]
+#![allow(warnings)]
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
@@ -6,10 +8,14 @@
 extern crate ndarray;
 use ndarray::{Array, Array1, Array2, Array3, Array4, ArrayD};
 use core::{f64, str};
-use std::{f64::consts::PI};
+use std::hash::Hash;
+use std::f64::consts::PI;
 use ndarray::prelude::*;
-
-
+use tch::{Tensor, Kind, Device};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use rand::rng;
+use rand::seq::SliceRandom;
 
 #[derive(Debug, Clone)]
 ///
@@ -508,8 +514,160 @@ impl Transformer {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct CharDataset {
+    pub words: Vec<String>,
+    pub chars: Vec<char>,
+    pub max_word_length: usize,
+    pub stoi: HashMap<char, i64>,       // maps character to index (starting at 1)
+    pub itos: HashMap<i64, char>,       // inverse mapping: index -> character
+}
 
-fn main() { 
+impl CharDataset {
+    pub fn new(words: Vec<String>, chars: Vec<char>, max_word_length: usize) -> Self {
+        let mut stoi: HashMap<char, i64> = HashMap::new();
+        // index starts at 1 to reserve 0 for a special token (<START> token)
+        for (i, &ch) in chars.iter().enumerate() {
+            stoi.insert(ch, i as i64 + 1);
+        } 
+        let itos: HashMap<i64, char> = stoi.iter()
+            .map(|(&ch, &i)| (i, ch))
+            .collect();
+        Self { words, chars, max_word_length, stoi, itos }
+    }
+
+    pub fn len(&self) -> usize {
+        self.words.len()
+    }    
+
+    pub fn contains(&self, word: &str) -> bool {
+        self.words.iter().any(|w| w == word)
+    }
+
+    pub fn get_vocab_size(&self) -> i64 {
+        self.chars.len() as i64 + 1
+    }
+
+    pub fn get_output_length(&self) -> usize {
+        self.max_word_length + 1
+    }
+
+    ///
+    /// Encodes a word into a tensor of indices.
+    pub fn encode(&self, word: &str) -> Tensor {
+        let indices: Vec<i64> = word.chars()
+            .map(|ch| {
+                // if a character is missing from the vocab, panic 
+                *self.stoi.get(&ch)
+                .unwrap_or_else(|| panic!("Character '{}' not found in vocabulary", ch))
+            })
+            .collect();
+        Tensor::f_from_slice(&indices).unwrap()
+    }
+
+    /// Decodes a tensor of indices into a string
+    pub fn decode(&self, ix: &Tensor) -> String {
+        // convert the tensor to a Vec<i64> assuming it is a 1-dim
+        let numel = ix.numel();
+        let mut indices = vec![0i64; numel as usize];
+        ix.copy_data(&mut indices, numel as usize);
+        indices.iter()
+            .map(|i| {
+                self.itos.get(i)
+                    .unwrap_or_else(|| panic!("Index '{}' not found in inverse vocabulary", i))  
+            })
+            .collect()
+    }
+
+    /// Returns an example pair (x, y) at the given index
+    /// 
+    /// - x : a tensor of size (max_word_length + 1) with a 0 at the start token
+    /// and the encoding of the word following it.
+    /// - y : a tensor of size (max_word_length + 1) where the first part is the word's
+    /// encoding and the remaining values are set of -1 (to mask the loss on inactive locations).
+    pub fn get(&self, idx: usize) -> (Tensor, Tensor) {
+        let word = &self.words[idx];
+        let encoded = self.encode(word);
+        let len_encoded = encoded.size()[0];
+        let output_length = self.get_output_length() as i64;
+
+        // create x and y tensors of the specified shape
+        let mut x = Tensor::zeros(&[output_length], (Kind::Int64, Device::Cpu));
+        let mut y = Tensor::zeros(&[output_length], (Kind::Int64, Device::Cpu));
+
+        // x: leave index 0 as the start token (0), then fill indices 1..(1 + len_encoded) with encoded values.
+        if len_encoded > 0 {
+            x.narrow(0, 1, len_encoded).copy_(&encoded);
+        }
+        // y: fill indices 0..len_encoded with encoded values.
+        if len_encoded > 0 {
+            y.narrow(0, 0, len_encoded).copy_(&encoded);
+        }
+        // y: set indices (len_codede + 1)..end to -1 to mask the loss
+        if len_encoded + 1 < output_length {
+            let remaining = output_length - len_encoded - 1;
+            y.narrow(0, len_encoded + 1, remaining).fill_(-1);
+        }
+
+        (x, y)
+    }
+
+}
+
+/// Reads an input text file, process the data, and returns training and test datasets.
+/// 
+/// The file is assumed to habe one word per line.
+pub fn create_datasets(input_file: &str) -> Result<(CharDataset, CharDataset), Box<dyn std::error::Error>> {
+    let data = fs::read_to_string(input_file)?;
+    let mut words: Vec<String> = data  
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    // Build the set of all unique charac
+    let mut char_set: HashSet<char> = HashSet::new();
+    for word in &words {
+        for ch in word.chars() {
+            char_set.insert(ch);
+        }
+    }
+    let mut chars: Vec<char> = char_set.into_iter().collect();
+    chars.sort();
+
+    let max_word_length = words.iter().map(|w| w.len()).max().unwrap_or(0);
+
+    println!("number of examples in the dataset: {}", words.len());
+    println!("max word length: {}", max_word_length);
+    println!("number of unique characters in the vocabulary: {}", chars.len());
+    println!("vocabulary:");
+    let vocab: String = chars.iter().collect();
+    println!("{}", vocab);
+
+    // Partition the words into training and test datasets.
+    // Test set size: either 10% of the data or up to 1000 examples.
+    let test_set_size = std::cmp::min(1000, (words.len() as f64 * 0.1).floor() as usize);
+
+    let mut indices: Vec<usize> = (0..words.len()).collect();
+    indices.shuffle(&mut rng());
+
+    let train_indices = &indices[..words.len() - test_set_size];
+    let test_indices = &indices[words.len()-test_set_size..];
+
+    let train_words: Vec<String> = train_indices.iter().map(|&i| words[i].clone()).collect();
+    let test_words: Vec<String> = test_indices.iter().map(|&i| words[i].clone()).collect();
+
+    println!("split up the dataset into {} training examples and {} test examples", train_words.len(), test_words.len());
+
+    let train_dataset = CharDataset::new(train_words, chars.clone(), max_word_length);
+    let test_dataset = CharDataset::new(test_words, chars.clone(), max_word_length);
+
+    Ok((train_dataset, test_dataset))
+}
+
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {  
 
     println!("
              // ----------------------------------------------------------------------------------------------------
@@ -581,7 +739,7 @@ fn main() {
 
     let transformer = Transformer::new(&config);
     let idx = Array2::<usize>::zeros((batch_size, sequencele_length));
-    println!("Initialized Transformer:\n{:#?}", transformer);
+    // println!("Initialized Transformer:\n{:#?}", transformer);
 
     // // Run forward pass test
     // let (logits, loss) = transformer.forward(&idx, None);
@@ -589,5 +747,36 @@ fn main() {
     // if let Some(l) = loss {
     //     println!("Loss: {}", l);
     // }
+
+    println!(
+        "// ----------------------------------------------------------------------------------------------------
+        //                                      Sample Test Dataset
+        // ----------------------------------------------------------------------------------------------------"
+    );
+
+    let input_file = "names.txt";
+    let (train_dataset, test_dataset) = create_datasets(input_file)?;
+
+    if train_dataset.len() > 0 {
+        let (x, y) = train_dataset.get(0);
+        println!("Example input tensor: {:?}", x);
+        println!("Exmaple output tensor: {:?}", y);
+        // skip start token
+        let decoded = train_dataset.decode(&x.narrow(0, 1, x.size()[0] - 1));
+        println!("Decoded word: {}", decoded);
+    }
+
+
+    /*
+        [TODO LIST]:
+            1. [ERROR] in the dataset creation I need to check the following 
+                thread 'main' panicked at src/main.rs:577:40:
+                Index '0' not found in inverse vocabulary
+                note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+    */      
+
+    Ok(())    
 }
+
 
